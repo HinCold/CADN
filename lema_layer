@@ -1,0 +1,264 @@
+class LEMALayer(nn.Module):
+    """Encoder layer block.
+
+    In the original paper each operation (multi-head attention or FFN) is
+    postprocessed with: `dropout -> add residual -> layernorm`. In the
+    tensor2tensor code they suggest that learning is more robust when
+    preprocessing each layer with layernorm and postprocessing with:
+    `dropout -> add residual`. We default to the approach in the paper, but the
+    tensor2tensor approach can be enabled by setting
+    *args.encoder_normalize_before* to ``True``.
+
+    Args:
+        args (argparse.Namespace): parsed command-line arguments
+    """
+
+    def __init__(self, args, drop_path_rate=0.0, use_adapter=False, adapter_dim=200, rev=False):
+        super().__init__()
+        self.args = args
+        self.use_adapter = use_adapter
+        self.embed_dim = args.encoder_embed_dim
+        if use_adapter:
+            self.adapter = Adapter_Layer(d_model=self.embed_dim, down_size=adapter_dim)
+        self.quant_noise = getattr(args, 'quant_noise_pq', 0)
+        self.quant_noise_block_size = getattr(args, 'quant_noise_pq_block_size', 8) or 8
+        self.self_attn = self.build_self_attention(self.embed_dim, args)
+
+
+        self.self_attn_layer_norm = LayerNorm(self.embed_dim)
+        self.dropout_module = FairseqDropout(
+            args.dropout, module_name=self.__class__.__name__
+        )
+
+        self.activation_fn = utils.get_activation_fn(
+            activation=getattr(args, 'activation_fn', 'relu') or "relu"
+        )
+        activation_dropout_p = getattr(args, "activation_dropout", 0) or 0
+        if activation_dropout_p == 0:
+            # for backwards compatibility with models that use args.relu_dropout
+            activation_dropout_p = getattr(args, "relu_dropout", 0) or 0
+        self.activation_dropout_module = FairseqDropout(
+            float(activation_dropout_p), module_name=self.__class__.__name__
+        )
+        self.normalize_before = args.encoder_normalize_before
+        self.fc1 = self.build_fc1(
+            self.embed_dim,
+            args.encoder_ffn_embed_dim,
+            self.quant_noise,
+            self.quant_noise_block_size,
+        )
+        self.fc2 = self.build_fc2(
+            args.encoder_ffn_embed_dim,
+            self.embed_dim,
+            self.quant_noise,
+            self.quant_noise_block_size,
+        )
+
+        self.attn_ln = LayerNorm(self.embed_dim) if getattr(args, 'scale_attn', False) else None
+        if rev:
+            self.co_self_attn = self.build_self_attention(self.embed_dim, args)
+            self.dropout_module1 = FairseqDropout(
+                args.dropout, module_name=self.__class__.__name__
+            )
+            self.attn_ln1 = LayerNorm(self.embed_dim) if getattr(args, 'scale_attn', False) else None
+            # self.conv3 = nn.Conv2d(1,1,3,padding=1)
+            # self.bn3 = nn.BatchNorm2d(1)
+            # self.self_attn_it = self.build_self_attention(self.embed_dim, args)
+            # self.attn_ln_it = LayerNorm(self.embed_dim) if getattr(args, 'scale_attn', False) else None
+            # self.dropout_module_it = FairseqDropout(
+            #     args.dropout, module_name=self.__class__.__name__
+            # )
+
+        self.nh = self.self_attn.num_heads
+        self.head_dim = self.self_attn.head_dim
+
+        self.ffn_layernorm = LayerNorm(args.encoder_ffn_embed_dim) if getattr(args, 'scale_fc', False) else None
+        self.w_resid = nn.Parameter(torch.ones(self.embed_dim, ), requires_grad=True) if getattr(args, 'scale_resids', False) else None
+
+        self.final_layer_norm = LayerNorm(self.embed_dim)
+
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
+        self.convs = nn.Conv2d(2, 1, kernel_size=3, padding=1)
+
+    def build_fc1(self, input_dim, output_dim, q_noise, qn_block_size):
+        return quant_noise(
+            nn.Linear(input_dim, output_dim), p=q_noise, block_size=qn_block_size
+        )
+
+    def build_fc2(self, input_dim, output_dim, q_noise, qn_block_size):
+        return quant_noise(
+            nn.Linear(input_dim, output_dim), p=q_noise, block_size=qn_block_size
+        )
+
+    def build_self_attention(self, embed_dim, args):
+        return MultiheadAttention(
+            embed_dim,
+            args.encoder_attention_heads,
+            dropout=args.attention_dropout,
+            self_attention=True,
+            q_noise=self.quant_noise,
+            qn_block_size=self.quant_noise_block_size,
+            scale_factor=args.attn_scale_factor,
+            scale_heads=getattr(args, 'scale_heads', False)
+        )
+
+    def residual_connection(self, x, residual):
+        return residual + self.drop_path(x)
+
+    def upgrade_state_dict_named(self, state_dict, name):
+        """
+        Rename layer norm states from `...layer_norms.0.weight` to
+        `...self_attn_layer_norm.weight` and `...layer_norms.1.weight` to
+        `...final_layer_norm.weight`
+        """
+        layer_norm_map = {"0": "self_attn_layer_norm", "1": "final_layer_norm"}
+        for old, new in layer_norm_map.items():
+            for m in ("weight", "bias"):
+                k = "{}.layer_norms.{}.{}".format(name, old, m)
+                if k in state_dict:
+                    state_dict["{}.{}.{}".format(name, new, m)] = state_dict[k]
+                    del state_dict[k]
+                if "{}.{}.{}".format(name, new, m) not in state_dict and "{}.{}".format(new, m) in self.state_dict():
+                    state_dict[
+                        "{}.{}.{}".format(name, new, m)
+                    ] = self.state_dict()["{}.{}".format(new, m)]
+
+        prefix = name + "." if name != "" else ""
+        for param_name, param_tensor in self.state_dict().items():
+            if (prefix + param_name) not in state_dict:
+                state_dict[prefix + param_name] = self.state_dict()[param_name]
+
+    def forward(
+        self,
+        x,
+        encoder_padding_mask: Optional[Tensor],
+        attn_mask: Optional[Tensor] = None,
+        self_attn_bias: Optional[Tensor] = None,
+        prompt_kv: Optional[Tensor] = None,
+        token_len = None,
+        reverse = False
+    ):
+        """
+        Args:
+            x (Tensor): input to the layer of shape `(seq_len, batch, embed_dim)`
+            encoder_padding_mask (ByteTensor): binary ByteTensor of shape
+                `(batch, seq_len)` where padding elements are indicated by ``1``.
+            attn_mask (ByteTensor): binary tensor of shape `(tgt_len, src_len)`,
+                where `tgt_len` is the length of output and `src_len` is the
+                length of input, though here both are equal to `seq_len`.
+                `attn_mask[tgt_i, src_j] = 1` means that when calculating the
+                embedding for `tgt_i`, we exclude (mask out) `src_j`. This is
+                useful for strided self-attention.
+
+        Returns:
+            encoded output of shape `(seq_len, batch, embed_dim)`
+        """
+
+       
+        if attn_mask is not None:
+            attn_mask = attn_mask.masked_fill(
+                attn_mask.to(torch.bool),
+                -1e8 if x.dtype == torch.float32 else -1e4
+            )
+
+        residual = x
+        if self.normalize_before:
+            # LN
+            # print("Ln before attn")
+            x = self.self_attn_layer_norm(x)
+        
+        x, _ = self.self_attn(
+            query=x,
+            key=x,
+            value=x,
+            key_padding_mask=encoder_padding_mask,
+            need_weights=False,
+            attn_mask=attn_mask,
+            attn_bias=self_attn_bias,
+            prompt_kv=prompt_kv
+        )
+       
+        if self.attn_ln is not None:
+            # LN
+            # print("Ln after attn")
+            x = self.attn_ln(x)
+        x = self.dropout_module(x)
+        x = self.residual_connection(x, residual)
+
+        if reverse:
+
+            residual = x
+
+            if token_len is not None:
+                reversed_x = x.clone()
+                reversed_x[:token_len, :, :] = x[-token_len:, :, :]
+                reversed_x[token_len:, :, :] = x[:x.size(0) - token_len, :, :]
+                x_q = reversed_x
+                # print(x_q.shape)
+            x_q = x[torch.randperm(x.size(0))]
+            ts = x.shape[0]
+            rxs = []
+            for i in range(ts-1):
+
+                max_result, _ = torch.max(x_q[i:(i+1)%ts, :, :], dim=0, keepdim=True)
+                avg_result = torch.mean(x_q[i:(i+1)%ts, :, :], dim=0, keepdim=True)
+                rs = torch.cat([max_result,avg_result], 0)
+                rxs.append(self.convs(rs.unsqueeze(0)))
+                
+            # special
+            max_result, _ = torch.max(torch.cat([x_q[0, :, :].unsqueeze(0), x_q[ts-1, :, :].unsqueeze(0)], 0), dim=0, keepdim=True)
+            # channel
+            avg_result = torch.mean(torch.cat([x_q[0, :, :].unsqueeze(0), x_q[ts-1, :, :].unsqueeze(0)], 0), dim=0, keepdim=True)
+            #
+            rs = torch.cat([max_result, avg_result], 0)
+            # print(rs.shape)
+
+            rxs.append(self.convs(rs.unsqueeze(0)))
+            x_q = torch.cat(rxs).squeeze(1)
+            print(x_q.shape)
+
+            x_q = self.bn3(self.conv3(x_q.permute(1,0,2).unsqueeze(1))).squeeze(1).permute(1,0,2)
+
+            x, _ = self.co_self_attn(
+                query=x_q,
+                key=x,
+                value=x,
+                key_padding_mask=encoder_padding_mask,
+                need_weights=False,
+                attn_mask=attn_mask,
+                attn_bias=self_attn_bias,
+                prompt_kv=prompt_kv
+            )
+            
+            if self.attn_ln1 is not None:
+                x = self.attn_ln1(x)
+            x = self.dropout_module1(x)
+            x = self.residual_connection(x, residual)
+           
+        if not self.normalize_before:
+            # LN
+            # print("Ln before  ffn")
+            x = self.self_attn_layer_norm(x)
+
+        residual = x
+        if self.normalize_before:
+            # LN
+            # print("Ln before fc1")
+            x = self.final_layer_norm(x)
+        x = self.activation_fn(self.fc1(x))
+        x = self.activation_dropout_module(x)
+        if self.ffn_layernorm is not None:
+            # LN
+            # print("Ln before before ffn")
+            x = self.ffn_layernorm(x)
+        x = self.fc2(x)
+        x = self.dropout_module(x)
+        if self.use_adapter:
+            x = self.adapter(x)
+        if self.w_resid is not None:
+            residual = torch.mul(self.w_resid, residual)
+        x = self.residual_connection(x, residual)
+        if not self.normalize_before:
+            # LN
+            x = self.final_layer_norm(x)
+        return x
